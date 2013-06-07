@@ -312,4 +312,4 @@ class HcfMiddleware(object):
 
     def _get_slot(self, request):
         """ Determine to which slot should be saved the request."""
-        return '0'
+        return self.hs_consume_from_slot
