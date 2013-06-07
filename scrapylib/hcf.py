@@ -46,9 +46,9 @@ The value of 'qdata' parameter could be retrieved later using
 The spider can override the default slot assignation function by setting the
 spider slot_callback method to a function with the following signature::
 
-   def slot_callback(request):
+   def hs_slot_for_request(request):
        ...
-       return slot
+       return 'slot'
 
 """
 import logging
@@ -169,7 +169,7 @@ class HcfMiddleware(object):
     def _enqueue_request(self, request, spider):
         """ Put request to HCF queue. """
 
-        slot_callback = getattr(spider, 'slot_callback', self._get_slot)
+        slot_callback = getattr(spider, 'hs_slot_for_request', self._get_slot)
         slot = slot_callback(request)
 
         hcf_params = request.meta.get('hcf_params')
