@@ -21,13 +21,13 @@ The next optional settings can be defined:
     HS_ENDPOINT - URL to the API endpoint, i.e: http://localhost:8003.
                   The default value is provided by the python-hubstorage
                   package.
-    HS_MAX_CONCURRENT_BATCHES - maximum number of concurrently processed
+    HCF_MAX_CONCURRENT_BATCHES - maximum number of concurrently processed
                                 batches. The defaut is 10.
 
 By default, middleware will use spider name as HCF frontier and '0' as slot
 both for getting new requests from HCF and putting requests to HCF.
 Default values can be overriden from inside a spider using the
-spider attributes: "hs_frontier" and "hs_slot" respectively. It is also
+spider attributes: "hcf_frontier" and "hcf_slot" respectively. It is also
 possible to override target frontier and slot using Request meta
 ('hcf_slot' and 'hcf_frontier' keys).
 
@@ -50,21 +50,23 @@ The value of 'qdata' parameter could be retrieved later using
 ``response.meta['hcf_params']['qdata']``.
 
 The spider can override how requests are serialized and deserialized
-for HCF by providing ``hs_make_request`` and/or ``hs_serialize_request``
+for HCF by providing ``hcf_make_request`` and/or ``hcf_serialize_request``
 methods with the following signatures::
 
-    def hs_deserialize_request(self, hcf_params, batch_id):
+    def hcf_deserialize_request(self, hcf_params, batch_id):
         # ...
         # url = hcf_params['fp']
         # return Request(url)
 
-    def hs_serialize_request(self, request):
+    def hcf_serialize_request(self, request):
+        # if not request.meta.get('use_hcf', False):
+        #     return request
         # ...
         # return {'fp': request.url, 'qdata': {...} }
 
 This may be useful if your fingerprints are not URLs or you want to
-customize the process for other reasons (e.g. to make use_hcf flag unnecessary).
-If your ``hs_serialize_request`` decided not to serialize a request
+customize the process for other reasons (e.g. to make "use_hcf" flag unnecessary).
+If your ``hcf_serialize_request`` decided not to serialize a request
 (or can't serialize it) then return request unchanged - it will be scheduled
 without HCF.
 
@@ -88,7 +90,7 @@ class HcfMiddleware(object):
         self.hs_endpoint = crawler.settings.get("HS_ENDPOINT")
         self.hs_auth = self._get_config(crawler, "HS_AUTH")
         self.hs_projectid = self._get_config(crawler, "HS_PROJECTID")
-        self.hs_max_concurrent_batches = int(crawler.settings.get('HS_MAX_CONCURRENT_BATCHES', 10))
+        self.hcf_max_concurrent_batches = int(crawler.settings.get('HCF_MAX_CONCURRENT_BATCHES', 10))
 
         self.hsclient = HubstorageClient(auth=self.hs_auth, endpoint=self.hs_endpoint)
         self.project = self.hsclient.get_project(self.hs_projectid)
@@ -134,10 +136,10 @@ class HcfMiddleware(object):
         # XXX: Running this middleware for several spiders concurrently
         # is not supported; multiple input slots/frontiers are also unsupported
         # (they complicate e.g. batch removing)
-        self.hs_consume_from_frontier = getattr(spider, 'hs_frontier', spider.name)
-        self.hs_consume_from_slot = getattr(spider, 'hs_slot', '0')
-        self._msg('Input frontier: %s' % self.hs_consume_from_frontier)
-        self._msg('Input slot: %s' % self.hs_consume_from_slot)
+        self.consume_from_frontier = getattr(spider, 'hcf_frontier', spider.name)
+        self.consume_from_slot = getattr(spider, 'hcf_slot', '0')
+        self._msg('Input frontier: %s' % self.consume_from_frontier)
+        self._msg('Input slot: %s' % self.consume_from_slot)
 
         self.has_new_requests = False
         for req in self._get_new_requests(spider):
@@ -165,7 +167,7 @@ class HcfMiddleware(object):
         Put all applicable Requests from ``result`` iterator to a HCF queue,
         yield other objects.
         """
-        serialize = getattr(spider, 'hs_serialize_request', self._serialize_request)
+        serialize = getattr(spider, 'hcf_serialize_request', self._serialize_request)
         num_enqueued = 0
         for request in result:
             if not isinstance(request, Request):  # item or None
@@ -187,8 +189,8 @@ class HcfMiddleware(object):
 
     def _get_output_hcf_path(self, request):
         """ Determine to which frontier and slot should be saved the request. """
-        frontier = request.meta.get('hcf_frontier', self.hs_consume_from_frontier)
-        slot = request.meta.get('hcf_slot', self.hs_consume_from_slot)
+        frontier = request.meta.get('hcf_frontier', self.consume_from_frontier)
+        slot = request.meta.get('hcf_slot', self.consume_from_slot)
         return frontier, slot
 
     def _serialize_request(self, request):
@@ -208,7 +210,7 @@ class HcfMiddleware(object):
         data.update(request.meta.get('hcf_params', {}))
         return data
 
-    def _hs_deserialize_request(self, hcf_params, batch_id):
+    def _deserialize_request(self, hcf_params, batch_id):
         return Request(
             url=hcf_params['fp'],
             meta={'hcf_params': hcf_params}
@@ -237,9 +239,9 @@ class HcfMiddleware(object):
         """ Get a new batch of links from the HCF."""
         num_links = 0
         num_batches = 0
-        make_request = getattr(spider, 'hs_deserialize_request', self._hs_deserialize_request)
+        deserialize_request = getattr(spider, 'hcf_deserialize_request', self._deserialize_request)
 
-        new_batches = self._get_new_batches(self.hs_max_concurrent_batches)
+        new_batches = self._get_new_batches(self.hcf_max_concurrent_batches)
         for num_batches, batch in enumerate(new_batches, 1):
             self._msg("incoming batch: len=%d, id=%s" % (len(batch['requests']), batch['id']))
 
@@ -248,12 +250,12 @@ class HcfMiddleware(object):
             self.batches[batch['id']] = done, todo
 
             for fp, qdata in batch['requests']:
-                request = make_request({'fp': fp, 'qdata': qdata}, batch['id'])
+                request = deserialize_request({'fp': fp, 'qdata': qdata}, batch['id'])
                 request.meta.setdefault(self.PRIVATE_INFO_KEY, (batch['id'], fp))
                 yield request
                 num_links += 1
 
-        self._msg('Read %d new links from %d batches, slot(%s)' % (num_links, num_batches, self.hs_consume_from_slot))
+        self._msg('Read %d new links from %d batches, slot(%s)' % (num_links, num_batches, self.consume_from_slot))
         self._msg('Current batches: %s' % self._get_batch_sizes())
 
     def _get_new_batches(self, max_batches):
@@ -271,7 +273,7 @@ class HcfMiddleware(object):
             # TODO: hook =====================
             # e.g. it should be possible to use roundrobin itertools recipe
             # for fetching batches from several slots
-            new_batches = self.fclient.read(self.hs_consume_from_frontier, self.hs_consume_from_slot)
+            new_batches = self.fclient.read(self.consume_from_frontier, self.consume_from_slot)
             # ================================
 
             # HCF could return already buffered batches; remove them
@@ -296,18 +298,18 @@ class HcfMiddleware(object):
 
             self.seen_batch_ids.update(b['id'] for b in self.batches_buffer)
             num_read = len(self.batches_buffer) + num_consumed - buffer_size
-            self._msg('Read %d new batches from slot(%s)' % (num_read, self.hs_consume_from_slot))
+            self._msg('Read %d new batches from slot(%s)' % (num_read, self.consume_from_slot))
 
     def _delete_processed_batches(self):
         """ Delete in the HCF the ids of the processed batches."""
         self._msg("Deleting batches: %r" % self._get_batch_sizes())
         ids = self._get_processed_batch_ids()
-        self.fclient.delete(self.hs_consume_from_frontier, self.hs_consume_from_slot, ids)
+        self.fclient.delete(self.consume_from_frontier, self.consume_from_slot, ids)
         for batch_id in ids:
             del self.batches[batch_id]
 
         self._msg('Deleted %d processed batches in slot(%s)' % (
-                         len(ids), self.hs_consume_from_slot))
+                         len(ids), self.consume_from_slot))
         self._msg('%d remaining batches with %d remaining requests (and %d processed requests)' % (
             len(self.batches),
             sum(len(todo) for _, (done, todo) in self.batches.iteritems()),
