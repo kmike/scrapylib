@@ -53,13 +53,14 @@ The spider can override how requests are serialized and deserialized
 for HCF by providing ``hs_make_request`` and/or ``hs_serialize_request``
 methods with the following signatures::
 
-    def hs_make_request(self, fingerprint, data, batch_id):
+    def hs_deserialize_request(self, hcf_params, batch_id):
         # ...
-        return Request(..)
+        # url = hcf_params['fp']
+        # return Request(url)
 
     def hs_serialize_request(self, request):
         # ...
-        return {...}
+        # return {'fp': request.url, 'qdata': {...} }
 
 This may be useful if your fingerprints are not URLs or you want to
 customize the process for other reasons (e.g. to make use_hcf flag unnecessary).
@@ -203,11 +204,15 @@ class HcfMiddleware(object):
         # e.g. for non-default callbacks and extra meta values
         # which are not supported by this default serialization function
 
-        hcf_params = request.meta.get('hcf_params')
         data = {'fp': request.url}
-        if hcf_params:
-            data.update(hcf_params)
+        data.update(request.meta.get('hcf_params', {}))
         return data
+
+    def _hs_deserialize_request(self, hcf_params, batch_id):
+        return Request(
+            url=hcf_params['fp'],
+            meta={'hcf_params': hcf_params}
+        )
 
     def close_spider(self, spider, reason):
         # Close the frontier client in order to make sure that
@@ -232,7 +237,7 @@ class HcfMiddleware(object):
         """ Get a new batch of links from the HCF."""
         num_links = 0
         num_batches = 0
-        make_request = getattr(spider, 'hs_make_request', self._hs_make_request)
+        make_request = getattr(spider, 'hs_deserialize_request', self._hs_deserialize_request)
 
         new_batches = self._get_new_batches(self.hs_max_concurrent_batches)
         for num_batches, batch in enumerate(new_batches, 1):
@@ -242,17 +247,14 @@ class HcfMiddleware(object):
             done, todo = set(), set(fp for fp, data in batch['requests'])
             self.batches[batch['id']] = done, todo
 
-            for fingerprint, data in batch['requests']:
-                request = make_request(fingerprint, data, batch['id'])
-                request.meta.setdefault(self.PRIVATE_INFO_KEY, (batch['id'], fingerprint))
+            for fp, qdata in batch['requests']:
+                request = make_request({'fp': fp, 'qdata': qdata}, batch['id'])
+                request.meta.setdefault(self.PRIVATE_INFO_KEY, (batch['id'], fp))
                 yield request
                 num_links += 1
 
         self._msg('Read %d new links from %d batches, slot(%s)' % (num_links, num_batches, self.hs_consume_from_slot))
         self._msg('Current batches: %s' % self._get_batch_sizes())
-
-    def _hs_make_request(self, fingerprint, data, batch_id):
-        return Request(url=fingerprint, meta={'hcf_params': {'qdata': data}})
 
     def _get_new_batches(self, max_batches):
         """
