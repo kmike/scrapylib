@@ -15,11 +15,6 @@ And the next settings need to be defined:
 
     HS_AUTH     - API key
     HS_PROJECTID - Project ID in the panel.
-    HS_FRONTIER  - Frontier name.
-    HS_CONSUME_FROM_SLOT - Slot from where the spider will read new URLs.
-
-Note that HS_FRONTIER and HS_SLOT can be overriden from inside a spider using
-the spider attributes: "hs_frontier" and "hs_consume_from_slot" respectively.
 
 The next optional settings can be defined:
 
@@ -28,6 +23,13 @@ The next optional settings can be defined:
                   package.
     HS_MAX_CONCURRENT_BATCHES - maximum number of concurrently processed
                                 batches. The defaut is 10.
+
+By default, middleware will use spider name as HCF frontier and '0' as slot
+both for getting new requests from HCF and putting requests to HCF.
+Default values can be overriden from inside a spider using the
+spider attributes: "hs_frontier" and "hs_slot" respectively. It is also
+possible to override target frontier and slot using Request meta
+('hcf_slot' and 'hcf_frontier' keys).
 
 The next keys can be defined in a Request meta in order to control the behavior
 of the HCF middleware:
@@ -40,15 +42,30 @@ of the HCF middleware:
         fdata    data to be stored along with the fingerprint in the fingerprint set
         p    Priority - lower priority numbers are returned first. The default is 0
 
+    hcf_slot - If present, this slot is used for storing request in the HCF.
+    hcf_frontier - If present, this frontier is used for storing request
+                   in the HCF.
+
 The value of 'qdata' parameter could be retrieved later using
 ``response.meta['hcf_params']['qdata']``.
 
-The spider can override the default slot assignation function by setting the
-spider slot_callback method to a function with the following signature::
+The spider can override how requests are serialized and deserialized
+for HCF by providing ``hs_make_request`` and/or ``hs_serialize_request``
+methods with the following signatures::
 
-   def hs_slot_for_request(request):
-       ...
-       return 'slot'
+    def hs_make_request(self, fingerprint, data, batch_id):
+        # ...
+        return Request(..)
+
+    def hs_serialize_request(self, request):
+        # ...
+        return {...}
+
+This may be useful if your fingerprints are not URLs or you want to
+customize the process for other reasons (e.g. to make use_hcf flag unnecessary).
+If your ``hs_serialize_request`` decided not to serialize a request
+(or can't serialize it) then return request unchanged - it will be scheduled
+without HCF.
 
 """
 import logging
@@ -60,11 +77,6 @@ from scrapy.http import Request
 from hubstorage import HubstorageClient
 
 
-# class HcfStoreStrategy(object):
-#     def __init__(self, hubstorage_client):
-#         self.client = hubstorage_client
-#
-
 class HcfMiddleware(object):
 
     PRIVATE_INFO_KEY = '__hcf_info__'
@@ -75,8 +87,6 @@ class HcfMiddleware(object):
         self.hs_endpoint = crawler.settings.get("HS_ENDPOINT")
         self.hs_auth = self._get_config(crawler, "HS_AUTH")
         self.hs_projectid = self._get_config(crawler, "HS_PROJECTID")
-        self.hs_frontier = self._get_config(crawler, "HS_FRONTIER")
-        self.hs_consume_from_slot = self._get_config(crawler, "HS_CONSUME_FROM_SLOT")
         self.hs_max_concurrent_batches = int(crawler.settings.get('HS_MAX_CONCURRENT_BATCHES', 10))
 
         self.hsclient = HubstorageClient(auth=self.hs_auth, endpoint=self.hs_endpoint)
@@ -98,7 +108,7 @@ class HcfMiddleware(object):
         # Another way to solve this is to reschedule unfinished requests to
         # new batches and mark all existing as processed.
         self.batches_buffer = collections.deque()
-        self.seen_batch_ids = set()
+        self.seen_batch_ids = set()  # XXX: are batch ids globally unique?
 
         crawler.signals.connect(self.close_spider, signals.spider_closed)
         crawler.signals.connect(self.idle_spider, signals.spider_idle)
@@ -119,9 +129,27 @@ class HcfMiddleware(object):
     def from_crawler(cls, crawler):
         return cls(crawler)
 
+    def process_start_requests(self, start_requests, spider):
+        # XXX: Running this middleware for several spiders concurrently
+        # is not supported; multiple input slots/frontiers are also unsupported
+        # (they complicate e.g. batch removing)
+        self.hs_consume_from_frontier = getattr(spider, 'hs_frontier', spider.name)
+        self.hs_consume_from_slot = getattr(spider, 'hs_slot', '0')
+        self._msg('Input frontier: %s' % self.hs_consume_from_frontier)
+        self._msg('Input slot: %s' % self.hs_consume_from_slot)
+
+        self.has_new_requests = False
+        for req in self._get_new_requests(spider):
+            self.has_new_requests = True
+            yield req
+
+        # if there are no links in the hcf, use the start_requests
+        if not self.has_new_requests:
+            self._msg('Using start_requests')
+            for non_hcf_item in self._hcf_process_spider_result(start_requests, spider):
+                yield non_hcf_item
+
     def process_spider_output(self, response, result, spider):
-        # XXX: or maybe use process_spider_input?
-        # or process_spider_exception?
         if self.PRIVATE_INFO_KEY in response.meta:
             batch_id, fp = response.meta[self.PRIVATE_INFO_KEY]
             done, todo = self.batches[batch_id]
@@ -136,70 +164,50 @@ class HcfMiddleware(object):
         Put all applicable Requests from ``result`` iterator to a HCF queue,
         yield other objects.
         """
+        serialize = getattr(spider, 'hs_serialize_request', self._serialize_request)
         num_enqueued = 0
-        for item in result:
-            if not self._is_hcf_request(item) or not self._valid_hcf_request(item):
-                yield item
+        for request in result:
+            if not isinstance(request, Request):  # item or None
+                yield request
                 continue
-            self._enqueue_request(item, spider)
+
+            data = serialize(request)
+            if isinstance(data, Request):
+                # this is a standard non-HCF request or serialization failed
+                yield data
+                continue
+
+            frontier, slot = self._get_output_hcf_path(request)
+            self.fclient.add(frontier, slot, [data])
             num_enqueued += 1
 
         if num_enqueued:
             self._msg("%d requests are put to queue" % num_enqueued)
 
-    def _is_hcf_request(self, item):
-        """ Return if an item is a request intended to be stored in HCF queue """
-        return isinstance(item, Request) and item.meta.get('use_hcf', False)
+    def _get_output_hcf_path(self, request):
+        """ Determine to which frontier and slot should be saved the request. """
+        frontier = request.meta.get('hcf_frontier', self.hs_consume_from_frontier)
+        slot = request.meta.get('hcf_slot', self.hs_consume_from_slot)
+        return frontier, slot
 
-    def _valid_hcf_request(self, request):
-        """
-        Return True if a request could be enqueued;
-        return False and log an error otherwise.
-        """
+    def _serialize_request(self, request):
+        if not request.meta.get('use_hcf', False):
+            # standard request
+            return request
+
         if request.method != 'GET':
             self._msg("'use_hcf' meta key is not supported "
                       "for non GET requests (%s)" % request.url, log.ERROR)
-            return False
-
-        # TODO: more validation rules,
-        # e.g. for non-default callbacks and extra meta values.
-
-        return True
-
-    def _enqueue_request(self, request, spider):
-        """ Put request to HCF queue. """
-
-        slot_callback = getattr(spider, 'hs_slot_for_request', self._get_slot)
-        slot = slot_callback(request)
+            return request
+        # TODO: more validation rules?
+        # e.g. for non-default callbacks and extra meta values
+        # which are not supported by this default serialization function
 
         hcf_params = request.meta.get('hcf_params')
-        fp = {'fp': request.url}
+        data = {'fp': request.url}
         if hcf_params:
-            fp.update(hcf_params)
-
-        # This is not necessarily a request to HCF because there is a batch
-        # uploader in python-hubstorage, so it is fine to send a single item
-        self.fclient.add(self.hs_frontier, slot, [fp])
-        # self._msg("request enqueued to slot(%s)" % slot, log.DEBUG)
-
-    def process_start_requests(self, start_requests, spider):
-
-        self.hs_frontier = getattr(spider, 'hs_frontier', self.hs_frontier)
-        self._msg('Using HS_FRONTIER=%s' % self.hs_frontier)
-
-        self.hs_consume_from_slot = getattr(spider, 'hs_consume_from_slot', self.hs_consume_from_slot)
-        self._msg('Using HS_CONSUME_FROM_SLOT=%s' % self.hs_consume_from_slot)
-
-        self.has_new_requests = False
-        for req in self._get_new_requests():
-            self.has_new_requests = True
-            yield req
-
-        # if there are no links in the hcf, use the start_requests
-        if not self.has_new_requests:
-            self._msg('Using start_requests')
-            for non_hcf_item in self._hcf_process_spider_result(start_requests, spider):
-                yield non_hcf_item
+            data.update(hcf_params)
+        return data
 
     def close_spider(self, spider, reason):
         # Close the frontier client in order to make sure that
@@ -213,37 +221,38 @@ class HcfMiddleware(object):
         self._delete_processed_batches()
 
         has_new_requests = False
-        for request in self._get_new_requests():
+        for request in self._get_new_requests(spider):
             self.crawler.engine.schedule(request, spider)
             has_new_requests = True
 
         if has_new_requests:
             raise DontCloseSpider()
 
-    def _get_new_requests(self):
+    def _get_new_requests(self, spider):
         """ Get a new batch of links from the HCF."""
         num_links = 0
         num_batches = 0
-        new_batches = self._get_new_batches(self.hs_max_concurrent_batches)
+        make_request = getattr(spider, 'hs_make_request', self._hs_make_request)
 
+        new_batches = self._get_new_batches(self.hs_max_concurrent_batches)
         for num_batches, batch in enumerate(new_batches, 1):
             self._msg("incoming batch: len=%d, id=%s" % (len(batch['requests']), batch['id']))
 
             assert batch['id'] not in self.batches
-            self.batches[batch['id']] = set(), set(fp for fp, data in batch['requests'])
+            done, todo = set(), set(fp for fp, data in batch['requests'])
+            self.batches[batch['id']] = done, todo
 
             for fingerprint, data in batch['requests']:
-                # TODO: hook for custom Request instantiation =========
-                meta = {
-                    self.PRIVATE_INFO_KEY: (batch['id'], fingerprint),
-                    'hcf_params': {'qdata': data},
-                }
-                yield Request(url=fingerprint, meta=meta)
-                # ======================================================
+                request = make_request(fingerprint, data, batch['id'])
+                request.meta.setdefault(self.PRIVATE_INFO_KEY, (batch['id'], fingerprint))
+                yield request
                 num_links += 1
 
         self._msg('Read %d new links from %d batches, slot(%s)' % (num_links, num_batches, self.hs_consume_from_slot))
         self._msg('Current batches: %s' % self._get_batch_sizes())
+
+    def _hs_make_request(self, fingerprint, data, batch_id):
+        return Request(url=fingerprint, meta={'hcf_params': {'qdata': data}})
 
     def _get_new_batches(self, max_batches):
         """
@@ -260,7 +269,7 @@ class HcfMiddleware(object):
             # TODO: hook =====================
             # e.g. it should be possible to use roundrobin itertools recipe
             # for fetching batches from several slots
-            new_batches = self.fclient.read(self.hs_frontier, self.hs_consume_from_slot)
+            new_batches = self.fclient.read(self.hs_consume_from_frontier, self.hs_consume_from_slot)
             # ================================
 
             # HCF could return already buffered batches; remove them
@@ -287,18 +296,11 @@ class HcfMiddleware(object):
             num_read = len(self.batches_buffer) + num_consumed - buffer_size
             self._msg('Read %d new batches from slot(%s)' % (num_read, self.hs_consume_from_slot))
 
-    def _get_processed_batch_ids(self):
-        return [batch_id for batch_id, (done, todo) in self.batches.iteritems() if not todo]
-
-    def _get_batch_sizes(self):
-        return [(len(done), len(todo)) for _, (done, todo) in self.batches.iteritems()]
-
     def _delete_processed_batches(self):
         """ Delete in the HCF the ids of the processed batches."""
         self._msg("Deleting batches: %r" % self._get_batch_sizes())
-
         ids = self._get_processed_batch_ids()
-        self.fclient.delete(self.hs_frontier, self.hs_consume_from_slot, ids)
+        self.fclient.delete(self.hs_consume_from_frontier, self.hs_consume_from_slot, ids)
         for batch_id in ids:
             del self.batches[batch_id]
 
@@ -310,6 +312,8 @@ class HcfMiddleware(object):
             sum(len(done) for _, (done, todo) in self.batches.iteritems()),
         ))
 
-    def _get_slot(self, request):
-        """ Determine to which slot should be saved the request."""
-        return self.hs_consume_from_slot
+    def _get_processed_batch_ids(self):
+        return [batch_id for batch_id, (done, todo) in self.batches.iteritems() if not todo]
+
+    def _get_batch_sizes(self):
+        return [(len(done), len(todo)) for _, (done, todo) in self.batches.iteritems()]
