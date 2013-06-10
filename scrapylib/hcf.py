@@ -220,10 +220,15 @@ class HcfMiddleware(object):
         )
 
     def close_spider(self, spider, reason):
-        # When spider is closed, some of the scheduled requests
-        # might be not processed yet; _delete_processed_batches
-        # doesn't remove such requests.
-        self._delete_processed_batches()
+        if reason == 'finished':
+            # When spider finished normally, all scheduled requests are
+            # somehow processed, so we can delete them from HCF.
+            self._delete_started_batches()
+        else:
+            # When spider is not finished normally, some of the
+            # scheduled requests might be not processed yet;
+            # _delete_processed_batches doesn't remove such requests.
+            self._delete_processed_batches()
 
         # Close the frontier client in order to make sure that
         # all the new links are stored.
