@@ -153,14 +153,17 @@ class HcfMiddleware(object):
                 yield non_hcf_item
 
     def process_spider_output(self, response, result, spider):
-        if self.PRIVATE_INFO_KEY in response.meta:
-            batch_id, fp = response.meta[self.PRIVATE_INFO_KEY]
+        self._mark_as_done(response.meta)
+        for non_hcf_item in self._hcf_process_spider_result(result, spider):
+            yield non_hcf_item
+
+    def _mark_as_done(self, meta):
+        if self.PRIVATE_INFO_KEY in meta:
+            batch_id, fp = meta[self.PRIVATE_INFO_KEY]
             done, todo = self.batches[batch_id]
             done.add(fp)
             todo.remove(fp)
-
-        for non_hcf_item in self._hcf_process_spider_result(result, spider):
-            yield non_hcf_item
+            self._msg('%s is removed from batch(%s)' % (fp, batch_id))
 
     def _hcf_process_spider_result(self, result, spider):
         """
@@ -213,19 +216,28 @@ class HcfMiddleware(object):
     def _deserialize_request(self, hcf_params, batch_id):
         return Request(
             url=hcf_params['fp'],
-            meta={'hcf_params': hcf_params}
+            meta={'hcf_params': hcf_params},
         )
 
     def close_spider(self, spider, reason):
+        # When spider is closed, some of the scheduled requests
+        # might be not processed yet; _delete_processed_batches
+        # doesn't remove such requests.
+        self._delete_processed_batches()
+
         # Close the frontier client in order to make sure that
         # all the new links are stored.
-        self._delete_processed_batches()
         self.fclient.close()
         self.hsclient.close()
 
     def idle_spider(self, spider):
         self.fclient.flush()
-        self._delete_processed_batches()
+
+        # If spider entered idle state then all scheduled requests
+        # were somehow processed, so we may remove all requests from
+        # scheduled batches in HCF. It is hard to track all requests
+        # otherwise because of download errors, DNS errors, redirects, etc.
+        self._delete_started_batches()
 
         has_new_requests = False
         for request in self._get_new_requests(spider):
@@ -300,9 +312,17 @@ class HcfMiddleware(object):
             num_read = len(self.batches_buffer) + num_consumed - buffer_size
             self._msg('Read %d new batches from slot(%s)' % (num_read, self.consume_from_slot))
 
+    def _delete_started_batches(self):
+        """ Delete all started batches from HCF """
+        self._msg("Deleting started batches: %r" % self._get_batch_sizes())
+        ids = self.batches.keys()
+        self.fclient.delete(self.consume_from_frontier, self.consume_from_slot, ids)
+        for batch_id in ids:
+            del self.batches[batch_id]
+
     def _delete_processed_batches(self):
         """ Delete in the HCF the ids of the processed batches."""
-        self._msg("Deleting batches: %r" % self._get_batch_sizes())
+        self._msg("Deleting processed batches: %r" % self._get_batch_sizes())
         ids = self._get_processed_batch_ids()
         self.fclient.delete(self.consume_from_frontier, self.consume_from_slot, ids)
         for batch_id in ids:
@@ -315,6 +335,7 @@ class HcfMiddleware(object):
             sum(len(todo) for _, (done, todo) in self.batches.iteritems()),
             sum(len(done) for _, (done, todo) in self.batches.iteritems()),
         ))
+        # self._msg("remaining: %r" % [todo for _, (done, todo) in self.batches.iteritems()])
 
     def _get_processed_batch_ids(self):
         return [batch_id for batch_id, (done, todo) in self.batches.iteritems() if not todo]
