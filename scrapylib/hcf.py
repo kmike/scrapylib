@@ -22,7 +22,7 @@ The next optional settings can be defined:
                   The default value is provided by the python-hubstorage
                   package.
     HCF_MAX_CONCURRENT_BATCHES - maximum number of concurrently processed
-                                batches. The defaut is 10.
+                                batches. The defaut is 5.
 
 By default, middleware will use spider name as HCF frontier and '0' as slot
 both for getting new requests from HCF and putting requests to HCF.
@@ -90,7 +90,7 @@ class HcfMiddleware(object):
         self.hs_endpoint = crawler.settings.get("HS_ENDPOINT")
         self.hs_auth = self._get_config(crawler, "HS_AUTH")
         self.hs_projectid = self._get_config(crawler, "HS_PROJECTID")
-        self.hcf_max_concurrent_batches = int(crawler.settings.get('HCF_MAX_CONCURRENT_BATCHES', 10))
+        self.hcf_max_concurrent_batches = int(crawler.settings.get('HCF_MAX_CONCURRENT_BATCHES', 5))
 
         self.hsclient = HubstorageClient(auth=self.hs_auth, endpoint=self.hs_endpoint)
         self.project = self.hsclient.get_project(self.hs_projectid)
