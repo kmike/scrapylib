@@ -105,9 +105,11 @@ class HcfMiddleware(object):
         # because in case of error we reprocess batches that are partially
         # complete, and all concurrently processed batches could be partially
         # complete because we don't enforce sequential processing order.
+        #
         # For example, if we have 1000 batches and each of them
-        # have 99 requests done, 1 unfinished then in case of error we'll
+        # has 99 requests done, 1 unfinished then in case of error we'll
         # need to reprocess all 99000 finished requests.
+        #
         # Another way to solve this is to reschedule unfinished requests to
         # new batches and mark all existing as processed.
         self.batches_buffer = collections.deque()
@@ -322,8 +324,7 @@ class HcfMiddleware(object):
         self._msg("Deleting started batches: %r" % self._get_batch_sizes())
         ids = self.batches.keys()
         self.fclient.delete(self.consume_from_frontier, self.consume_from_slot, ids)
-        for batch_id in ids:
-            del self.batches[batch_id]
+        self.batches.clear()
 
     def _delete_processed_batches(self):
         """ Delete in the HCF the ids of the processed batches."""
