@@ -165,7 +165,7 @@ class HcfMiddleware(object):
             done, todo = self.batches[batch_id]
             done.add(fp)
             todo.remove(fp)
-            self._msg('%s is removed from batch(%s)' % (fp, batch_id))
+            self._msg('%s is removed from batch(%s)' % (fp, batch_id), log.DEBUG)
 
     def _hcf_process_spider_result(self, result, spider):
         """
