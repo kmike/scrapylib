@@ -190,7 +190,10 @@ class HcfMiddleware(object):
             num_enqueued += 1
 
         if num_enqueued:
-            self._msg("%d requests are put to queue" % num_enqueued)
+            self._msg("%d requests are put to queue" % num_enqueued, log.DEBUG)
+            self.crawler.stats.inc_value('hcf/requests/enqueued', num_enqueued)
+            self.crawler.stats.inc_value('hcf/spider_results_with_hcf_requests')
+
 
     def _get_output_hcf_path(self, request):
         """ Determine to which frontier and slot should be saved the request. """
@@ -262,7 +265,7 @@ class HcfMiddleware(object):
 
         new_batches = self._get_new_batches(self.hcf_max_concurrent_batches)
         for num_batches, batch in enumerate(new_batches, 1):
-            self._msg("incoming batch: len=%d, id=%s" % (len(batch['requests']), batch['id']))
+            self._msg("incoming batch: len=%d, id=%s" % (len(batch['requests']), batch['id']), log.DEBUG)
 
             assert batch['id'] not in self.batches
             done, todo = set(), set(fp for fp, data in batch['requests'])
@@ -274,6 +277,8 @@ class HcfMiddleware(object):
                 yield request
                 num_links += 1
 
+        self.crawler.stats.inc_value('hcf/batches/fetched', num_batches)
+        self.crawler.stats.inc_value('hcf/requests/fetched', num_links)
         self._msg('Read %d new links from %d batches, slot(%s)' % (num_links, num_batches, self.consume_from_slot))
         self._msg('Current batches: %s' % self._get_batch_sizes())
 
@@ -321,16 +326,25 @@ class HcfMiddleware(object):
 
     def _delete_started_batches(self):
         """ Delete all started batches from HCF """
+        sizes = self._get_batch_sizes()
         self._msg("Deleting started batches: %r" % self._get_batch_sizes())
         ids = self.batches.keys()
         self.fclient.delete(self.consume_from_frontier, self.consume_from_slot, ids)
+        self.crawler.stats.inc_value('hcf/batches/dequeued', len(ids))
+        self.crawler.stats.inc_value('hcf/requests/dequeued', sum(done+todo for done, todo in sizes))
         self.batches.clear()
 
     def _delete_processed_batches(self):
         """ Delete in the HCF the ids of the processed batches."""
-        self._msg("Deleting processed batches: %r" % self._get_batch_sizes())
+        sizes = self._get_batch_sizes()
+        self._msg("Deleting processed batches: %r" % sizes)
         ids = self._get_processed_batch_ids()
         self.fclient.delete(self.consume_from_frontier, self.consume_from_slot, ids)
+
+        dequeued_requests_num = sum(len(self.batches[id_][0]) for id_ in ids)
+        self.crawler.stats.inc_value('hcf/batches/dequeued', len(ids))
+        self.crawler.stats.inc_value('hcf/requests/dequeued', dequeued_requests_num)
+
         for batch_id in ids:
             del self.batches[batch_id]
 
