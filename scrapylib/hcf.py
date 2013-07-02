@@ -143,13 +143,13 @@ class HcfMiddleware(object):
         self._msg('Input frontier: %s' % self.consume_from_frontier)
         self._msg('Input slot: %s' % self.consume_from_slot)
 
-        self.has_new_requests = False
+        has_new_requests = False
         for req in self._get_new_requests(spider):
-            self.has_new_requests = True
+            has_new_requests = True
             yield req
 
         # if there are no links in the hcf, use the start_requests
-        if not self.has_new_requests:
+        if not has_new_requests:
             self._msg('Using start_requests')
             for non_hcf_item in self._hcf_process_spider_result(start_requests, spider):
                 yield non_hcf_item
